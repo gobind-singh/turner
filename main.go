@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"gortc.io/stun"
 	"gortc.io/turn"
@@ -26,6 +25,14 @@ var (
 	username = flag.String("u", "user", "username")
 	password = flag.String("p", "secret", "password")
 )
+
+type TurnConnection struct {
+	//	ControlClient     *turnc.Client
+	//	DataClient        *turnc.Client
+	ControlConnection *turnc.Connection
+	DataConnection    net.Conn //*turnc.Connection
+	ControlConn       net.Conn
+}
 
 func copyHeader(dst, src http.Header) {
 	for k, vv := range src {
@@ -74,19 +81,18 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Println(peer)
 
-	control_conn, dest_conn, err := connectTurn(peer)
-	if err != nil {
-		if control_conn != nil {
-			control_conn.Close()
+	turnConnection, err := connectTurn(peer)
+	if err != nil || turnConnection.DataConnection == nil {
+		if turnConnection.DataConnection != nil {
+			turnConnection.DataConnection.Close()
 		}
-		if dest_conn != nil {
-			dest_conn.Close()
+		if turnConnection.ControlConnection != nil {
+			turnConnection.ControlConnection.Close()
 		}
 
-		http.Error(w, "Proxy encountered error", http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Proxy encountered error: %s", err), http.StatusInternalServerError)
 		return
 	}
-	defer control_conn.Close()
 
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -100,18 +106,18 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// Don't forget to close the connection:
 	defer conn.Close()
-
+	defer turnConnection.ControlConn.Close()
 	//ugly hack to recreate same function that could be achieved with httputil.DumpRequest
 	// create method line
 	methodLine := fmt.Sprintf("%s %s %s\r\n", r.Method, r.URL.Path, r.Proto)
 	hostLine := fmt.Sprintf("Host: %s\r\n", target)
-	dest_conn.Write([]byte(methodLine))
-	dest_conn.Write([]byte(hostLine))
-	dest_conn.Write(bufHeader(r.Header))
-	dest_conn.Write([]byte("\r\n"))
+	turnConnection.DataConnection.Write([]byte(methodLine))
+	turnConnection.DataConnection.Write([]byte(hostLine))
+	turnConnection.DataConnection.Write(bufHeader(r.Header))
+	turnConnection.DataConnection.Write([]byte("\r\n"))
 	//drain body
 
-	io.Copy(dest_conn, r.Body)
+	io.Copy(turnConnection.DataConnection, r.Body)
 
 	/*
 		// Would have loved to just use DumpRequest here
@@ -123,31 +129,32 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprint(err), http.StatusInternalServerError)
 			return
 		}
-		dest_conn.Write(dump)
+		destConn.Write(dump)
 		fmt.Printf("%q\n", dump)
 	*/
-	defer dest_conn.Close()
+	//defer destConn.Close()
 
-	dest_conn.SetReadBuffer(2048)
+	//turnConnection.DataConnection.SetReadBuffer(2048)
 
-	timeoutDuration := 5 * time.Second
-	//bufReader := bufio.NewReader(dest_conn)
-	buf := make([]byte, 2048)
+	//timeoutDuration := 5 * time.Second
+	//bufReader := bufio.NewReader(destConn)
+
+	defer turnConnection.ControlConnection.Close()
+	defer turnConnection.DataConnection.Close()
+
+	buf := make([]byte, 1024)
 	for {
 		// Set a deadline for reading. Read operation will fail if no data
 		// is received after deadline.
-		dest_conn.SetReadDeadline(time.Now().Add(timeoutDuration))
+		//turnConnection.DataConnection.SetReadDeadline(time.Now().Add(timeoutDuration))
 
-		n, err := dest_conn.Read(buf)
+		n, err := turnConnection.DataConnection.Read(buf)
 		if err != nil {
-			if err == io.EOF {
-				continue
-			}
 			break
 		}
 		/*
 			// Read tokens delimited by newline
-			bytes, err := dest_conn.Read()
+			bytes, err := destConn.Read()
 			if err != nil {
 				fmt.Println(err)
 				break
@@ -160,9 +167,11 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 }
 
+//func transfer(destination io.WriteCloser, source io.ReadCloser, wg sync.WaitGroup) {
 func transfer(destination io.WriteCloser, source io.ReadCloser) {
 	defer destination.Close()
 	defer source.Close()
+	//defer wg.Done()
 	io.Copy(destination, source)
 }
 
@@ -178,7 +187,7 @@ func handleProxyTun(w http.ResponseWriter, r *http.Request) {
 	port := r.URL.Port()
 
 	if port == "" {
-		port = "80"
+		port = "443"
 	}
 	peer := target
 	if strings.Index(target, ":") == -1 {
@@ -191,103 +200,127 @@ func handleProxyTun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
 	}
-	client_conn, _, err := hijacker.Hijack()
+	clientConn, _, err := hijacker.Hijack()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	}
 
-	control_conn, dest_conn, err := connectTurn(peer)
-	if err != nil {
-		if control_conn != nil {
-			control_conn.Close()
+	turnConnection, err := connectTurn(peer)
+	if err != nil || turnConnection.DataConnection == nil {
+		if turnConnection.DataConnection != nil {
+			turnConnection.DataConnection.Close()
 		}
-		if dest_conn != nil {
-			dest_conn.Close()
+		if turnConnection.ControlConnection != nil {
+			turnConnection.ControlConnection.Close()
 		}
-		client_conn.Write([]byte("Proxy encountered error"))
-	}
-	go transfer(dest_conn, client_conn)
-	transfer(client_conn, dest_conn)
 
-	defer control_conn.Close()
-	defer dest_conn.Close()
+		http.Error(w, fmt.Sprintf("Proxy encountered error: %s", err), http.StatusInternalServerError)
+		return
+	}
+
+	/*
+		wg := sync.WaitGroup{}
+		wg.Add(2)
+
+		go transfer(turnConnection.DataConnection, clientConn, wg)
+		go transfer(clientConn, turnConnection.DataConnection, wg)
+
+		wg.Wait()
+		fmt.Println("close!")
+		turnConnection.ControlConnection.Close()
+		turnConnection.DataConnection.Close()
+	*/
+	defer turnConnection.ControlConn.Close()
+	defer turnConnection.DataConnection.Close()
+
+	go transfer(turnConnection.DataConnection, clientConn)
+	transfer(clientConn, turnConnection.DataConnection)
 }
 
-func connectTurn(target string) (*net.TCPConn, *net.TCPConn, error) {
+func connectTurn(target string) (TurnConnection, error) {
+	turnConnection := TurnConnection{}
+	var err error
 	// Resolving to TURN server.
 	raddr, err := net.ResolveTCPAddr("tcp", *server)
 	if err != nil {
 		fmt.Println(err)
-		return nil, nil, err
+		return turnConnection, err
 	}
 	c, err := net.DialTCP("tcp", nil, raddr)
 	if err != nil {
 		fmt.Println(err)
-		return nil, nil, err
+		return turnConnection, err
 	}
+	turnConnection.ControlConn = c
 	fmt.Printf("dial server %s -> %s\n", c.LocalAddr(), c.RemoteAddr())
-	client, clientErr := turnc.New(turnc.Options{
+	controlClient, err := turnc.New(turnc.Options{
 		Conn:     c,
 		Username: *username,
 		Password: *password,
 	})
-	if clientErr != nil {
-		fmt.Println(clientErr)
-		return c, nil, err
-	}
-	a, allocErr := client.AllocateTCP()
-	if allocErr != nil {
-		fmt.Println(allocErr)
-		return c, nil, err
-	}
-	peerAddr, resolveErr := net.ResolveTCPAddr("tcp", target)
-	if resolveErr != nil {
-		fmt.Println(resolveErr)
-		return c, nil, err
-	}
-	fmt.Println("create peer")
-	permission, createErr := a.Create(peerAddr.IP)
-	if createErr != nil {
-		fmt.Println(createErr)
-		return c, nil, err
-	}
-	fmt.Println("create peer")
-	conn, err := permission.CreateTCP(peerAddr)
+
 	if err != nil {
 		fmt.Println(err)
-		return c, nil, err
+		return turnConnection, err
+	}
+	a, err := controlClient.AllocateTCP()
+	if err != nil {
+		fmt.Println(err)
+		return turnConnection, err
+	}
+	peerAddr, err := net.ResolveTCPAddr("tcp", target)
+	if err != nil {
+		fmt.Println(err)
+		return turnConnection, err
+	}
+	fmt.Println("create peer")
+	permission, err := a.Create(peerAddr.IP)
+	if err != nil {
+		fmt.Println(err)
+		return turnConnection, err
+	}
+	fmt.Println("create peer permission")
+	turnConnection.ControlConnection, err = permission.CreateTCP(peerAddr)
+	if err != nil {
+		fmt.Println(err)
+		return turnConnection, err
 	}
 
 	fmt.Println("send connect request")
 	var connid stun.RawAttribute
-	if connid, err = conn.Connect(); err != nil {
+	if connid, err = turnConnection.ControlConnection.Connect(); err != nil {
 		fmt.Println(err)
-		return c, nil, err
+		return turnConnection, err
 	}
 
 	// setup bind
 	fmt.Println("setting up bind")
-	cb, err := net.DialTCP("tcp", nil, raddr)
+	cd, err := net.DialTCP("tcp", nil, raddr)
 	if err != nil {
 		fmt.Println(err)
-		return c, nil, err
+		return turnConnection, err
 	}
-	clientb, clientErr := turnc.New(turnc.Options{
-		Conn:     cb,
+
+	turnConnection.DataConnection = cd
+	fmt.Println("bind client create")
+	dataClient, err := turnc.New(turnc.Options{
+		Conn:     cd,
 		Username: *username,
 		Password: *password,
 	})
-	if clientErr != nil {
-		fmt.Println(clientErr)
-		return c, cb, err
-	}
-
-	err = clientb.ConnectionBind(turn.ConnectionID(binary.BigEndian.Uint32(connid.Value)))
 	if err != nil {
 		fmt.Println(err)
-		return c, cb, err
+		return turnConnection, err
 	}
-	return c, cb, nil
+
+	fmt.Println("binding")
+	err = dataClient.ConnectionBind(turn.ConnectionID(binary.BigEndian.Uint32(connid.Value)))
+	if err != nil {
+		fmt.Println(err)
+		return turnConnection, err
+	}
+
+	return turnConnection, nil
 }
 
 func main() {
